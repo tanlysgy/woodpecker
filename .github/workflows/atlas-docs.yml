@@ -1,0 +1,300 @@
+# Atlas · 云端构建文档站并发布到 GitHub Pages
+#
+# 这个仓库是文档站镜像:工作流只存在于 atlas-docs 分支,源码直接从上游仓库
+# 拉取,构建全部在 GitHub Actions 免费算力上完成,不向任何代码分支写提交,
+# 也不会触发上游自己的 CI。
+#
+# 构建顺序:
+#   1. 有 mkdocs/mdbook/docusaurus/sphinx 配置就按它原生构建;
+#   2. 任一原生构建失败或没有产物,就退化成「把 docs/ 下的 Markdown
+#      用 mkdocs-material 渲染」,保证一定出站。
+name: Atlas · docs site
+
+on:
+  schedule:
+    - cron: "37 4 * * 1"
+  push:
+    branches: [atlas-docs]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: atlas-docs
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ATLAS_UPSTREAM: woodpecker-ci/woodpecker
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: woodpecker-ci/woodpecker
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install python toolchain
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip -q
+          pip install -q mkdocs mkdocs-material pymdown-extensions
+      - name: Detect generator
+        id: detect
+        run: |
+          mkdocs_cfg="$(find . -maxdepth 3 -name 'mkdocs.yml' -o -maxdepth 3 -name 'mkdocs.yaml' | head -1)"
+          book_cfg="$(find . -maxdepth 3 -name 'book.toml' | head -1)"
+          docusaurus_cfg="$(find . -maxdepth 3 \( -name 'docusaurus.config.js' -o -name 'docusaurus.config.ts' -o -name 'docusaurus.config.mjs' \) -not -path './site/*' | head -1)"
+          sphinx_cfg="$(find . -maxdepth 3 -name 'conf.py' -not -path '*/node_modules/*' | head -1)"
+          { echo "mkdocs_cfg=$mkdocs_cfg"; echo "book_cfg=$book_cfg"
+            echo "docusaurus_cfg=$docusaurus_cfg"; echo "sphinx_cfg=$sphinx_cfg"; } >> "$GITHUB_OUTPUT"
+          echo "mkdocs=$mkdocs_cfg mdbook=$book_cfg docusaurus=$docusaurus_cfg sphinx=$sphinx_cfg"
+          mkdir -p "$GITHUB_WORKSPACE/_atlas_site"
+
+      - name: Build · mkdocs
+        if: steps.detect.outputs.mkdocs_cfg != ''
+        continue-on-error: true
+        run: |
+          CFG="${{ steps.detect.outputs.mkdocs_cfg }}"
+          python - "$CFG" <<'PY'
+          import re, sys
+          path = sys.argv[1]
+          lines = open(path, encoding="utf-8").read().splitlines()
+          out, skip = [], False
+          for line in lines:
+              if re.match(r'^(site_url|repo_url|repo_name|edit_uri|plugins|markdown_extensions|watch|extra_css|extra_javascript|hooks|strict|copyright|nav)\s*:', line):
+                  skip = True
+                  continue
+              if skip:
+                  if re.match(r'^\S', line) and line.strip():
+                      skip = False
+                  else:
+                      continue
+              out.append(line)
+          out += ["plugins: []", "markdown_extensions: []", "use_directory_urls: true", "nav:"]
+          open(path, "w", encoding="utf-8").write("\n".join(out) + "\n")
+          PY
+          pip install -q -r requirements.txt 2>/dev/null || pip install -q -r "$(dirname "$CFG")/requirements.txt" 2>/dev/null || true
+          mkdocs build -f "$CFG" -d "$GITHUB_WORKSPACE/_atlas_site_try" || exit 0
+          rm -rf "$GITHUB_WORKSPACE/_atlas_site"; mv "$GITHUB_WORKSPACE/_atlas_site_try" "$GITHUB_WORKSPACE/_atlas_site"
+
+      - name: Build · sphinx
+        if: steps.detect.outputs.sphinx_cfg != '' && hashFiles('_atlas_site/index.html') == ''
+        continue-on-error: true
+        run: |
+          pip install -q sphinx sphinx-rtd-theme myst-parser furo 2>/dev/null || true
+          DIR="$(dirname "${{ steps.detect.outputs.sphinx_cfg }}")"
+          pip install -q -r "$DIR/requirements.txt" 2>/dev/null || true
+          sphinx-build -b html "$DIR" "$GITHUB_WORKSPACE/_atlas_site_try" || exit 0
+          rm -rf "$GITHUB_WORKSPACE/_atlas_site"; mv "$GITHUB_WORKSPACE/_atlas_site_try" "$GITHUB_WORKSPACE/_atlas_site"
+
+      - name: Build · mdbook
+        if: steps.detect.outputs.book_cfg != '' && hashFiles('_atlas_site/index.html') == ''
+        continue-on-error: true
+        run: |
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /usr/local/bin
+          DIR="$(dirname "${{ steps.detect.outputs.book_cfg }}")"
+          (cd "$DIR" && mdbook build) || exit 0
+          OUT="$(python3 -c "
+          import re
+          t=open('$DIR/book.toml',encoding='utf-8').read()
+          m=re.search(r'build-dir\s*=\s*\"([^\"]+)\"',t)
+          print('$DIR/' + (m.group(1) if m else 'book'))
+          ")"
+          rm -rf "$GITHUB_WORKSPACE/_atlas_site"; mkdir -p "$GITHUB_WORKSPACE/_atlas_site"
+          cp -a "$OUT"/. "$GITHUB_WORKSPACE/_atlas_site/" 2>/dev/null || true
+
+      - name: Setup node + pnpm
+        if: steps.detect.outputs.docusaurus_cfg != '' && hashFiles('_atlas_site/index.html') == ''
+        continue-on-error: true
+        run: |
+          curl -sSL https://deb.nodesource.com/setup_22.x | sudo -E bash - >/dev/null 2>&1 || true
+          sudo apt-get install -y nodejs >/dev/null 2>&1 || true
+          node -v || true
+          sudo corepack enable >/dev/null 2>&1 || true
+          corepack prepare pnpm@9 --activate >/dev/null 2>&1 || sudo npm install -g pnpm@9 >/dev/null 2>&1 || true
+          pnpm -v || true
+      - name: Build · docusaurus
+        if: steps.detect.outputs.docusaurus_cfg != '' && hashFiles('_atlas_site/index.html') == ''
+        continue-on-error: true
+        run: |
+          CFG="${{ steps.detect.outputs.docusaurus_cfg }}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          python3 - "$CFG" "$REPO" <<'PY'
+          import re, sys
+          path, repo = sys.argv[1], sys.argv[2]
+          src = open(path, encoding="utf-8").read()
+          src = re.sub(r"baseUrl:\s*['\"][^'\"]*['\"]", "baseUrl: '/%s/'" % repo, src, count=1)
+          src = re.sub(r"organizationName:\s*['\"][^'\"]*['\"]", "organizationName: 'github'", src, count=1)
+          src = re.sub(r"projectName:\s*['\"][^'\"]*['\"]", "projectName: '%s'" % repo, src, count=1)
+          open(path, "w", encoding="utf-8").write(src)
+          PY
+          npm install -g pnpm@9 >/dev/null 2>&1 || true
+          DIR="$(dirname "$CFG")"
+          cd "$DIR"
+          (pnpm install --ignore-scripts --no-frozen-lockfile || npm install --no-audit --no-fund) >/dev/null 2>&1 || exit 0
+          (pnpm exec docusaurus build --out-dir "$GITHUB_WORKSPACE/_atlas_site_try" || npx docusaurus build --out-dir "$GITHUB_WORKSPACE/_atlas_site_try") || exit 0
+          rm -rf "$GITHUB_WORKSPACE/_atlas_site"; mv "$GITHUB_WORKSPACE/_atlas_site_try" "$GITHUB_WORKSPACE/_atlas_site"
+
+      - name: Fallback · render Markdown docs with mkdocs
+        if: hashFiles('_atlas_site/index.html') == ''
+        run: |
+          python3 - <<'PY'
+          import pathlib, shutil, sys
+
+          root = pathlib.Path(".")
+          def count(d):
+              p = root / d
+              if not p.is_dir():
+                  return -1
+              return len([x for x in p.rglob("*.md") if "node_modules" not in x.parts])
+
+          cands = ["docs", "doc", "documentation", "website/docs", "website/content",
+                   "content", "site/docs", "wiki", "manual", "handbook"]
+          extra = [str(p.relative_to(root)) for p in root.glob("*/docs") if p.is_dir()]
+          extra += [str(p.relative_to(root)) for p in root.glob("*/*/docs") if p.is_dir()]
+          best, best_n = None, 0
+          for c in cands + extra:
+              n = count(c)
+              if n > best_n:
+                  best, best_n = c, n
+
+          stage = root / "_atlas_docs_src"
+          if stage.exists():
+              shutil.rmtree(stage)
+          stage.mkdir()
+
+          picked = 0
+          if best is not None:
+              src = root / best
+              for p in src.rglob("*"):
+                  if not p.is_file():
+                      continue
+                  rel = p.relative_to(src)
+                  if "node_modules" in rel.parts or any(part.startswith(".") for part in rel.parts):
+                      continue
+                  dst = stage / rel
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  try:
+                      shutil.copy(p, dst)
+                      picked += 1
+                  except OSError:
+                      pass
+          if picked == 0:
+              for name in ("README.md", "readme.md", "CONTRIBUTING.md", "USAGE.md",
+                           "INSTALL.md", "docs.md", "CHANGELOG.md"):
+                  f = root / name
+                  if f.is_file() and f.suffix == ".md":
+                      shutil.copy(f, stage / ("index.md" if picked == 0 else name))
+                      picked += 1
+
+          entries = []
+          for p in sorted(stage.rglob("*.md")):
+              rel = p.relative_to(stage).as_posix()
+              title = p.stem.replace("-", " ").replace("_", " ").strip().title() or "Index"
+              entries.append((rel, title))
+          if not entries:
+              (stage / "index.md").write_text("# Documentation mirror\n", encoding="utf-8")
+              entries = [("index.md", "Index")]
+          entries.sort(key=lambda it: (0 if it[0].lower() == "index.md" else 1, it[0]))
+
+          has_index = any(e[0].lower() in ("index.md", "readme.md") for e in entries)
+          if not has_index:
+              lines = ["# Documentation index", "",
+                       "This is an Atlas mirror of the upstream project documentation.", ""]
+              groups = {}
+              for rel, title in entries:
+                  top = rel.split("/")[0] if "/" in rel else ""
+                  groups.setdefault(top, []).append((rel, title))
+              for top in sorted(groups):
+                  if top:
+                      lines += ["## %s" % top.replace("-", " ").replace("_", " ").title(), ""]
+                  for rel, title in groups[top]:
+                      lines.append("- [%s](%s)" % (title, rel))
+                  lines.append("")
+              (stage / "index.md").write_text("\n".join(lines), encoding="utf-8")
+              entries.insert(0, ("index.md", "Index"))
+              has_index = True
+
+          print("docs source:", best, "copied:", picked, "pages:", len(entries), file=sys.stderr)
+
+          cfg = [
+              "site_name: Atlas docs mirror",
+              "docs_dir: _atlas_docs_src",
+              "use_directory_urls: true",
+              "theme:", "  name: material",
+              "  features:", "    - navigation.top", "    - navigation.sections",
+              "    - navigation.expand", "    - content.code.copy", "    - search.highlight",
+              "    - search.suggest",
+              "plugins: []",
+              "markdown_extensions:",
+              "  - admonition", "  - attr_list", "  - tables", "  - footnotes",
+              "  - def_list", "  - md_in_html", "  - toc:", "      permalink: true",
+              "  - pymdownx.superfences", "  - pymdownx.highlight", "  - pymdownx.details",
+              "  - pymdownx.tasklist", "  - pymdownx.tilde", "  - pymdownx.caret",
+              "nav:",
+          ]
+          # keep nav shallow: group by top-level directory
+          grouped, order = {}, []
+          for rel, title in entries:
+              key = rel.split("/")[0] if "/" in rel else ""
+              if key not in grouped:
+                  grouped[key] = []
+                  order.append(key)
+              grouped[key].append((rel, title))
+          if len(entries) == 1:
+              cfg.append("  - Home: %s" % entries[0][0])
+          else:
+              for key in order:
+                  items = grouped[key][:200]
+                  if key == "":
+                      cfg += ["  - %s: %s" % (t.replace(":", " -").replace("#", ""), r) for r, t in items]
+                  else:
+                      label = key.replace("-", " ").replace("_", " ").strip().title()
+                      cfg.append("  - %s:" % label.replace(":", " -"))
+                      cfg += ["      - %s: %s" % (t.replace(":", " -").replace("#", ""), r) for r, t in items]
+          pathlib.Path("mkdocs.atlas.yml").write_text("\n".join(cfg) + "\n", encoding="utf-8")
+          PY
+          mkdocs build -f mkdocs.atlas.yml -d _atlas_site
+      - name: Ensure index.html exists
+        run: |
+          if [ -f _atlas_site/index.html ]; then exit 0; fi
+          echo "::warning::no index.html produced, generating a landing page"
+          python3 - <<'PY'
+          import pathlib
+          site = pathlib.Path("_atlas_site")
+          site.mkdir(exist_ok=True)
+          pages = sorted(p.relative_to(site).as_posix() for p in site.rglob("*.html"))
+          links = "\n".join('- [%s](%s)' % (p, p) for p in pages[:500])
+          if not links:
+              links = "- (no pages were produced by this build)"
+          site.joinpath("index.html").write_text(
+              "<!doctype html><html><head><meta charset='utf-8'>"
+              "<title>Atlas docs mirror</title>"
+              "<style>body{font-family:system-ui;max-width:52rem;margin:3rem auto;padding:0 1rem;"
+              "line-height:1.6}a{color:#0b6}</style></head><body>"
+              "<h1>Atlas docs mirror</h1><p>Upstream documentation pages produced by this build:</p>"
+              "<ul>" + "".join("<li><a href='%s'>%s</a></li>" % (p, p) for p in pages[:500]) +
+              "</ul></body></html>", encoding="utf-8")
+          print("generated landing page with", len(pages), "links")
+          PY
+      - name: Add .nojekyll
+        run: touch _atlas_site/.nojekyll
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _atlas_site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
